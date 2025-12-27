@@ -179,7 +179,7 @@ class VieNeuTTS:
         wav, _ = librosa.load(ref_audio_path, sr=16000, mono=True)
         wav_tensor = torch.from_numpy(wav).float().unsqueeze(0).unsqueeze(0)  # [1, 1, T]
         with torch.no_grad():
-            ref_codes = self.codec.encode_code(audio_or_path=wav_tensor).squeeze(0).squeeze(0)
+            ref_codes = self.codec.encode_code(audio_or_path=wav_tensor).squeeze(0).squeeze(0).cpu()
         return ref_codes
 
     def infer(self, text: str, ref_codes: np.ndarray | torch.Tensor, ref_text: str) -> np.ndarray:
@@ -558,9 +558,9 @@ class FastVieNeuTTS:
         wav, _ = librosa.load(ref_audio_path, sr=16000, mono=True)
         wav_tensor = torch.from_numpy(wav).float().unsqueeze(0).unsqueeze(0)
         with torch.no_grad():
-            ref_codes = self.codec.encode_code(audio_or_path=wav_tensor).squeeze(0).squeeze(0)
+            ref_codes = self.codec.encode_code(audio_or_path=wav_tensor).squeeze(0).squeeze(0).cpu()
         return ref_codes
-    
+
     def get_cached_reference(self, voice_name: str, audio_path: str, ref_text: str = None):
         """
         Get or create cached reference codes.

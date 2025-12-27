@@ -5,6 +5,7 @@ import tempfile
 import torch
 from vieneu_tts import VieNeuTTS, FastVieNeuTTS
 import os
+import sys
 import time
 import numpy as np
 from typing import Generator, Optional, Tuple
@@ -49,18 +50,36 @@ using_lmdeploy = False
 # Cache for reference texts
 _ref_text_cache = {}
 
+def is_macos_apple_silicon() -> bool:
+    """Check if running on macOS Apple Silicon."""
+    return sys.platform == "darwin" and torch.backends.mps.is_available()
+
+def should_use_mlx(backbone_choice: str, device_choice: str) -> bool:
+    """Determine if we should use MLX backend (macOS Apple Silicon)."""
+    if not is_macos_apple_silicon():
+        return False
+    if "gguf" in backbone_choice.lower():
+        return False  # Use llama.cpp Metal for GGUF
+    if device_choice in ("Auto", "MPS"):
+        return True
+    return False
+
 def should_use_lmdeploy(backbone_choice: str, device_choice: str) -> bool:
     """Determine if we should use LMDeploy backend."""
     if "gguf" in backbone_choice.lower():
         return False
-    
+
+    # Don't use LMDeploy on macOS (not supported)
+    if sys.platform == "darwin":
+        return False
+
     if device_choice == "Auto":
         has_gpu = torch.cuda.is_available()
     elif device_choice == "CUDA":
         has_gpu = torch.cuda.is_available()
     else:
         has_gpu = False
-    
+
     return has_gpu
 
 @lru_cache(maxsize=32)
@@ -74,6 +93,8 @@ def cleanup_gpu_memory():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+    if torch.backends.mps.is_available():
+        torch.mps.empty_cache()
     gc.collect()
 
 def load_model(backbone_choice: str, codec_choice: str, device_choice: str, 
@@ -96,9 +117,52 @@ def load_model(backbone_choice: str, codec_choice: str, device_choice: str,
         
         backbone_config = BACKBONE_CONFIGS[backbone_choice]
         codec_config = CODEC_CONFIGS[codec_choice]
-        
+
+        use_mlx = should_use_mlx(backbone_choice, device_choice)
         use_lmdeploy = should_use_lmdeploy(backbone_choice, device_choice)
-        
+
+        # MLX backend for macOS Apple Silicon
+        if use_mlx:
+            print(f"Using MLX backend for Apple Silicon")
+
+            try:
+                from vieneu_tts_mlx import MLXVieNeuTTS
+
+                print(f"Loading MLX model...")
+                print(f"   Backbone: {backbone_config['repo']} (MLX)")
+                print(f"   Codec: {codec_config['repo']} (MPS)")
+
+                tts = MLXVieNeuTTS(
+                    backbone_repo=backbone_config["repo"],
+                    codec_repo=codec_config["repo"],
+                    use_mlx_decoder=False,  # Use MPS decoder for now
+                )
+                using_lmdeploy = False  # Not using LMDeploy
+
+                current_backbone = backbone_choice
+                current_codec = codec_choice
+                model_loaded = True
+
+                success_msg = (
+                    f"Model loaded successfully!\n\n"
+                    f"Backend: MLX (Apple Silicon Optimized)\n"
+                    f"Model Device: MLX (Metal)\n"
+                    f"Codec Device: MPS\n"
+                    f"Streaming: Yes"
+                )
+
+                yield (
+                    success_msg,
+                    gr.update(interactive=True),
+                    gr.update(interactive=True)
+                )
+                return
+
+            except ImportError as e:
+                print(f"MLX not available: {e}")
+                print("   Falling back to standard backend...")
+                use_mlx = False
+
         if use_lmdeploy:
             lmdeploy_error_reason = None
             print(f"🚀 Using LMDeploy backend with optimizations")
@@ -160,26 +224,42 @@ def load_model(backbone_choice: str, codec_choice: str, device_choice: str,
                 using_lmdeploy = False
         
         if not use_lmdeploy:
-            print(f"📦 Using original backend")
-            
+            print(f"Using original backend")
+
             if device_choice == "Auto":
                 if "gguf" in backbone_choice.lower():
-                    backbone_device = "gpu" if torch.cuda.is_available() else "cpu"
+                    # GGUF uses "gpu" for CUDA/Metal
+                    if torch.cuda.is_available():
+                        backbone_device = "gpu"
+                    elif is_macos_apple_silicon():
+                        backbone_device = "gpu"  # llama.cpp Metal
+                    else:
+                        backbone_device = "cpu"
                 else:
-                    backbone_device = "cuda" if torch.cuda.is_available() else "cpu"
-                
+                    if torch.cuda.is_available():
+                        backbone_device = "cuda"
+                    elif is_macos_apple_silicon():
+                        backbone_device = "mps"
+                    else:
+                        backbone_device = "cpu"
+
                 if "ONNX" in codec_choice:
                     codec_device = "cpu"
+                elif torch.cuda.is_available():
+                    codec_device = "cuda"
+                elif is_macos_apple_silicon():
+                    codec_device = "mps"
                 else:
-                    codec_device = "cuda" if torch.cuda.is_available() else "cpu"
+                    codec_device = "cpu"
             else:
                 backbone_device = device_choice.lower()
                 codec_device = device_choice.lower()
-                
+
                 if "ONNX" in codec_choice:
                     codec_device = "cpu"
-            
-            if "gguf" in backbone_choice.lower() and backbone_device == "cuda":
+
+            # GGUF uses "gpu" for both CUDA and Metal
+            if "gguf" in backbone_choice.lower() and backbone_device in ("cuda", "mps"):
                 backbone_device = "gpu"
             
             print(f"📦 Loading model...")
@@ -668,10 +748,18 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS") as demo:
             with gr.Row():
                 backbone_select = gr.Dropdown(list(BACKBONE_CONFIGS.keys()), value="VieNeu-TTS (GPU)", label="🦜 Backbone")
                 codec_select = gr.Dropdown(list(CODEC_CONFIGS.keys()), value="NeuCodec (Standard)", label="🎵 Codec")
-                device_choice = gr.Radio(["Auto", "CPU", "CUDA"], value="Auto", label="🖥️ Device")
+                # Build device list based on availability
+                _device_options = ["Auto", "CPU"]
+                if torch.cuda.is_available():
+                    _device_options.append("CUDA")
+                if is_macos_apple_silicon():
+                    _device_options.append("MPS")
+                device_choice = gr.Radio(_device_options, value="Auto", label="Device")
             
             with gr.Row():
-                enable_triton = gr.Checkbox(value=True, label="⚡ Enable Triton Compilation")
+                # Triton is not available on macOS
+                _triton_visible = sys.platform != "darwin"
+                enable_triton = gr.Checkbox(value=_triton_visible, label="Enable Triton Compilation", visible=_triton_visible)
                 max_batch_size = gr.Slider(
                     minimum=1, 
                     maximum=16, 
